@@ -221,10 +221,12 @@ th{background:#faf7ff;color:#6b5b83;font-size:9px}th,td{padding:7px;border-botto
         </div>
 
         </div>
-        <div class="page-title" style="margin-top:28px"><div><h2 style="font-size:18px">User Access</h2><p>Tick which pages each person can see. Only ticked pages appear in their sidebar. Create the login itself in Firebase Authentication and list the person under <b>staff</b> in the Realtime Database first.</p></div></div>
+        <div class="page-title" style="margin-top:28px"><div><h2 style="font-size:18px">User Access</h2><p>Enter the person's email, a password for them, their role and the pages they can see, then click <b>Save User</b>. They can log in straight away. Nothing else needs to be set up in Firebase.</p></div></div>
         <div class="panel">
           <div class="usergrid">
             <div class="field"><label>Email</label><input id="userEmail" type="email" placeholder="name@company.com"></div>
+            <div class="field"><label>Password for this person (min 6 characters)</label><input id="userPass" type="text" placeholder="Set a password"></div>
+            <div class="field"><label>Role</label><select id="userRole"><option value="editor">Editor - can change data</option><option value="viewer">Viewer - view only</option><option value="admin">Admin - everything, can add users</option></select></div>
             
           </div>
           <div class="permrow">
@@ -240,7 +242,7 @@ th{background:#faf7ff;color:#6b5b83;font-size:9px}th,td{padding:7px;border-botto
         <div class="panel">
           <div class="table-wrap"><table><thead><tr><th>Email</th><th>Access</th><th class="num"></th></tr></thead><tbody id="userBody"></tbody></table></div>
         </div>
-        <div class="note">Logins are handled by Firebase Authentication (passwords are never stored in this page). Whether someone can read or change data is enforced by the database security rules, based on their role under <b>staff</b> (admin, editor or viewer). The ticks above only control which menu pages a person sees.</div>
+        <div class="note">Logins are handled by Firebase Authentication, so passwords are never stored in this page. To change a password later, use <b>Reset password</b> (an email is sent to the person). <b>Remove</b> blocks the person from the data immediately. The ticks above only control which menu pages a person sees; the role decides whether they can read or change data.</div>
       </section>
 
       <section id="recipesPage" class="hidden">
@@ -410,7 +412,7 @@ function loadFromSnapshot(snap){
 function readOldBrowserData(){
   const g=(k,f)=>{try{return JSON.parse(localStorage.getItem(k)||'null')||f}catch(e){return f}};
   return {recipes:g(KEY_RECIPE,[]),production:g(KEY_PROD,[]),allowedLine:g(KEY_ALLOWED_LINE,{}),rmCost:g(KEY_COST,{}),
-    users:g(KEY_USERS,[]).map(u=>({email:u.email,perms:u.perms})),rmMaster:g(KEY_RMMASTER,{}),prodMeta:g(KEY_PRODMETA,{}),prodActive:g(KEY_PRODACTIVE,{})};
+    users:g(KEY_USERS,[]).map(u=>({email:u.email,perms:u.perms,uid:u.uid,role:u.role})),rmMaster:g(KEY_RMMASTER,{}),prodMeta:g(KEY_PRODMETA,{}),prodActive:g(KEY_PRODACTIVE,{})};
 }
 async function enterApp(user){
   if(enteringApp)return; enteringApp=true;
@@ -460,9 +462,15 @@ async function login(){
   setLoginMsg('Signing in...',true);
   try{ await fbAuth.signInWithEmailAndPassword(email,pass); }
   catch(e){
-    setLoginMsg(e&&e.code==='auth/too-many-requests' ? 'Too many attempts. Please wait a few minutes and try again.'
-      : e&&e.code==='auth/network-request-failed' ? 'Network error. Check your internet connection.'
-      : 'Incorrect email or password.');
+    const c=(e&&e.code)||'';
+    console.error('Login error:',c,e);
+    setLoginMsg(c==='auth/too-many-requests' ? 'Too many attempts. Please wait a few minutes and try again.'
+      : c==='auth/network-request-failed' ? 'Network error. Check your internet connection.'
+      : c==='auth/unauthorized-domain' ? 'This website address is not authorised in Firebase. Add it under Authentication > Settings > Authorized domains.'
+      : c==='auth/operation-not-allowed' ? 'Email/Password sign-in is not enabled in Firebase (Authentication > Sign-in method).'
+      : c==='auth/user-disabled' ? 'This account is disabled.'
+      : ['auth/invalid-credential','auth/wrong-password','auth/user-not-found','auth/invalid-email','auth/missing-password'].includes(c) ? 'Incorrect email or password.'
+      : 'Login failed ('+(c||'unknown error')+').');
   }
 }
 function logout(){ if(fbAuth){fbAuth.signOut().then(()=>location.reload());} else location.reload(); }
@@ -495,35 +503,84 @@ function applyPermissions(){
  }
 }
 function save(){ if(!canWrite)return; savePending=true; clearTimeout(saveTimer); saveTimer=setTimeout(flushSave,300); }
-function addUser(){
- let email=norm(document.getElementById('userEmail').value).toLowerCase();
-  if(!email)return alert('Please enter the email address.');
- let perms={
-  dashboard:document.getElementById('permDashboard').checked,
-  load:document.getElementById('permLoad').checked,
-  daily:document.getElementById('permDaily').checked,
-  admin:document.getElementById('permAdmin').checked,
-  recipes:document.getElementById('permRecipes').checked
- };
- users=users.filter(x=>x.email.toLowerCase()!==email);
- users.push({email,perms});
- save();
- document.getElementById('userEmail').value='';
- renderUsers();
- showMsg('userMsg',`Access saved for ${email}.`);
+let secApp=null;
+function getSecAuth(){
+  if(!secApp){ secApp=firebase.initializeApp(firebaseConfig,'sec'); }
+  const a=secApp.auth(); a.setPersistence(firebase.auth.Auth.Persistence.NONE).catch(()=>{}); return a;
 }
-function deleteUser(email){if(!requireAdminPassword("remove user access"))return;
- if(!confirm(`Remove access for ${email}?`))return;
- users=users.filter(x=>x.email!==email);
- save();renderUsers();
+async function addUser(){
+  if(!currentUser||!currentUser.master)return alert('Only an administrator can add users.');
+  const email=norm(document.getElementById('userEmail').value).toLowerCase();
+  const pass=document.getElementById('userPass').value;
+  const role=document.getElementById('userRole').value;
+  if(!email)return alert('Please enter the email address.');
+  if(email===currentUser.email)return alert('You cannot change your own access here.');
+  const perms={
+    dashboard:document.getElementById('permDashboard').checked,
+    load:document.getElementById('permLoad').checked,
+    daily:document.getElementById('permDaily').checked,
+    admin:document.getElementById('permAdmin').checked,
+    recipes:document.getElementById('permRecipes').checked
+  };
+  const existing=users.find(x=>(x.email||'').toLowerCase()===email);
+  let uid=existing&&existing.uid;
+  const btn=document.querySelector('button[onclick="addUser()"]'); if(btn)btn.disabled=true;
+  try{
+    if(!uid){
+      if(!pass||pass.length<6){alert('Please enter a password of at least 6 characters for this person.');return;}
+      const sa=getSecAuth();
+      try{
+        const cred=await sa.createUserWithEmailAndPassword(email,pass); uid=cred.user.uid;
+      }catch(e){
+        const c=(e&&e.code)||'';
+        if(c==='auth/email-already-in-use'){
+          try{ const cred=await sa.signInWithEmailAndPassword(email,pass); uid=cred.user.uid; }
+          catch(e2){alert('This email already has a login. Enter that person\'s current password to link it, or delete the user in Firebase Authentication and try again.');return;}
+        }else if(c==='auth/admin-restricted-operation'||c==='auth/operation-not-allowed'){
+          alert('Firebase sign-up is switched off. In Firebase go to Authentication > Settings > User actions and turn ON "Enable create (sign-up)", then try again.');return;
+        }else if(c==='auth/invalid-email'){alert('That email address is not valid.');return;}
+        else if(c==='auth/weak-password'){alert('The password is too weak. Use at least 6 characters.');return;}
+        else{alert('Could not create the login: '+(c||(e&&e.message)||'unknown error'));return;}
+      }
+      try{await sa.signOut();}catch(_){}
+    }
+    try{ await fbDb.ref('staff/'+uid).set(role); }
+    catch(e){alert('Could not give access. The database rules need the latest update (staff write rule for admins). '+(e&&e.message?e.message:''));return;}
+    users=users.filter(x=>(x.email||'').toLowerCase()!==email);
+    users.push({email,perms,uid,role});
+    save(); await flushSave();
+    document.getElementById('userEmail').value='';document.getElementById('userPass').value='';
+    renderUsers();
+    showMsg('userMsg','Saved. '+email+' can now log in as '+role+'.');
+  }finally{ if(btn)btn.disabled=false; }
+}
+async function deleteUser(email){
+  if(!requireAdminPassword("remove user access"))return;
+  if(!confirm(`Remove access for ${email}? They will no longer be able to open the data.`))return;
+  const u=users.find(x=>(x.email||'')===email);
+  if(u&&u.uid){
+    try{ await fbDb.ref('staff/'+u.uid).remove(); }
+    catch(e){alert('Could not remove their access: '+(e&&e.message?e.message:e));return;}
+  }
+  users=users.filter(x=>(x.email||'')!==email);
+  save(); await flushSave(); renderUsers();
+  if(!(u&&u.uid))alert('Removed from the list. This person was added earlier, so also delete their entry under "staff" in the Realtime Database to fully block them.');
+}
+async function resetUserPassword(email){
+  if(!requireAdminPassword("reset a password"))return;
+  if(!confirm(`Send a password reset email to ${email}?`))return;
+  try{ await fbAuth.sendPasswordResetEmail(email); alert('Password reset email sent to '+email+'.'); }
+  catch(e){alert('Could not send the email: '+(e&&e.code?e.code:e));}
 }
 function renderUsers(){
  let b=document.getElementById('userBody'); if(!b)return; b.innerHTML='';
+ const roleName={admin:'Admin',editor:'Editor',viewer:'Viewer'};
  users.forEach(u=>{
-  let tags=PAGE_KEYS.filter(k=>u.perms[k]).map(k=>({dashboard:'Dashboard',load:'Production Load',daily:'Daily Production',admin:'Admin Control',recipes:'Recipe Master'}[k]));
-  b.innerHTML+=`<tr><td><b>${esc(u.email)}</b></td><td>${tags.map(t=>`<span class="pill" style="margin:2px">${esc(t)}</span>`).join('')||'<span style="color:#94a3b8">No pages</span>'}</td><td class="num"><button class="btn red sm" onclick="deleteUser('${escAttr(u.email)}')">Remove</button></td></tr>`;
+  let tags=PAGE_KEYS.filter(k=>u.perms&&u.perms[k]).map(k=>({dashboard:'Dashboard',load:'Production Load',daily:'Daily Production',admin:'Admin Control',recipes:'Recipe Master'}[k]));
+  let roleTag=u.role?`<span class="pill" style="margin:2px;background:#e0f2fe;color:#075985">${esc(roleName[u.role]||u.role)}</span>`:'';
+  b.innerHTML+=`<tr><td><b>${esc(u.email)}</b></td><td>${roleTag}${tags.map(t=>`<span class="pill" style="margin:2px">${esc(t)}</span>`).join('')||'<span style="color:#94a3b8">No pages</span>'}</td><td class="num"><button class="btn sm" onclick="resetUserPassword('${escAttr(u.email)}')">Reset password</button> <button class="btn red sm" onclick="deleteUser('${escAttr(u.email)}')">Remove</button></td></tr>`;
  });
- if(!b.innerHTML)b.innerHTML='<tr><td colspan="3" class="empty">No page permissions assigned yet. Administrators always see every page.</td></tr>';
+ if(!b.innerHTML)b.innerHTML='<tr><td colspan="3" class="empty">No users added yet. Administrators always see every page.</td></tr>';
 }
 function showPage(name,el){
   PAGE_KEYS.forEach(x=>document.getElementById(x+'Page').classList.add('hidden'));
