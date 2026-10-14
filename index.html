@@ -221,8 +221,47 @@ th{background:#faf7ff;color:#6b5b83;font-size:9px}th,td{padding:7px;border-botto
         </div>
 
         </div>
-        <div class="page-title" style="margin-top:28px"><div><h2 style="font-size:18px">User Access</h2><p>Logins and roles are managed in Firebase, so no passwords are kept in this app.</p></div></div>
-        <div class="note"><b>Roles:</b> <b>admin</b> = every page, can edit and delete &middot; <b>editor</b> = Dashboard, Production Load, Daily Production, Recipe Master &middot; <b>viewer</b> = Dashboard and Production Load (read only).<br><br><b>To add a user:</b> Firebase console &rarr; Authentication &rarr; Add user (email + password). Then Realtime Database &rarr; <code>staff</code> &rarr; add the user's UID as the key with value <code>admin</code>, <code>editor</code> or <code>viewer</code>.</div>
+        <div id="userAccessWrap" style="display:none">
+        <div class="page-title" style="margin-top:28px"><div><h2 style="font-size:18px">User Access</h2><p>Only people added here can log in. Choose a role, and tick the pages that person can see.</p></div></div>
+        <div class="panel">
+          <div class="usergrid">
+            <div class="field"><label>Email</label><input id="userEmail" type="email" placeholder="name@company.com" autocomplete="off"></div>
+            <div class="field"><label>Password <span style="font-weight:400;color:#6b7280">(new login only, min 6 characters)</span></label><input id="userPass" type="text" placeholder="Set a password" autocomplete="off"></div>
+            <div class="field"><label>Role</label>
+              <select id="userRole" onchange="onUserRoleChange()">
+                <option value="viewer">Viewer - view only, cannot save changes</option>
+                <option value="editor" selected>Editor - can add and change data</option>
+                <option value="admin">Admin - full access, manages users</option>
+              </select>
+            </div>
+          </div>
+          <div class="permrow">
+            <label><input type="checkbox" id="permDashboard" checked> Dashboard</label>
+            <label><input type="checkbox" id="permLoad" checked> Production Load</label>
+            <label><input type="checkbox" id="permDaily" checked> Daily Production</label>
+            <label><input type="checkbox" id="permAdmin"> Admin Control</label>
+            <label><input type="checkbox" id="permRecipes" checked> Recipe Master</label>
+          </div>
+          <details style="margin-bottom:14px;font-size:12px;color:#374151">
+            <summary style="cursor:pointer;font-weight:700">Login already exists in Firebase? (optional)</summary>
+            <div class="field" style="margin-top:8px"><label>User UID (Firebase &rarr; Authentication &rarr; Users)</label><input id="userUid" type="text" placeholder="Paste the User UID, leave password empty" autocomplete="off"></div>
+          </details>
+          <button id="userSaveBtn" class="btn" onclick="saveUserAccess()">Save User</button>
+          <button class="btn gray" onclick="clearUserForm()">Clear</button>
+          <div id="userMsg" class="note hidden" style="margin-top:12px"></div>
+        </div>
+        <div class="panel">
+          <div class="table-wrap"><table><thead><tr><th>Email</th><th>Role</th><th>Pages</th><th class="num"><button class="btn gray sm" onclick="loadAccessList()">Reload</button></th></tr></thead><tbody id="userBody"></tbody></table></div>
+        </div>
+        <div class="note"><b>Viewer</b> can only look (nothing they change is saved). <b>Editor</b> can add and change data. <b>Admin</b> can do everything, including adding users. Removing a user stops them logging in straight away.
+          <details style="margin-top:8px"><summary style="cursor:pointer;font-weight:700">One-time Firebase rules needed for this list</summary>
+          <div style="margin-top:6px">In Firebase &rarr; Realtime Database &rarr; Rules, add this block next to <code>"staff"</code> and <code>"app"</code>:<br>
+          <code style="display:block;white-space:pre-wrap;margin-top:6px">"access": {
+  ".read": "auth != null &amp;&amp; root.child('staff').child(auth.uid).val() === 'admin'",
+  ".write": "auth != null &amp;&amp; root.child('staff').child(auth.uid).val() === 'admin'",
+  "$uid": { ".read": "auth != null &amp;&amp; auth.uid === $uid" }
+}</code></div></details></div>
+      </div>
       </section>
 
       <section id="recipesPage" class="hidden">
@@ -356,11 +395,14 @@ function onManualProdChange(v){
   const el=document.getElementById('manUom');
   if(el)el.value=uom;
 }
-function makeUser(email,role){
-  const P=(o)=>Object.assign({dashboard:false,load:false,daily:false,admin:false,recipes:false},o);
-  if(role==='admin') return {email,role,master:true,perms:P({dashboard:true,load:true,daily:true,admin:true,recipes:true})};
-  if(role==='editor') return {email,role,master:false,perms:P({dashboard:true,load:true,daily:true,recipes:true})};
-  return {email,role:'viewer',master:false,perms:P({dashboard:true,load:true})};
+function makeUser(email,role,perms){
+  const NONE={dashboard:false,load:false,daily:false,admin:false,recipes:false};
+  let p;
+  if(role==='admin') p={dashboard:true,load:true,daily:true,admin:true,recipes:true};
+  else if(perms&&typeof perms==='object') p=Object.assign({},NONE,perms);
+  else if(role==='editor') p=Object.assign({},NONE,{dashboard:true,load:true,daily:true,recipes:true});
+  else p=Object.assign({},NONE,{dashboard:true,load:true});
+  return {email,role:(role==='admin'||role==='editor')?role:'viewer',master:role==='admin',perms:p};
 }
 function friendlyAuthError(e){
   const c=(e&&e.code)||'';
@@ -387,13 +429,21 @@ async function login(){
       msg.textContent='This account has no access yet. Ask the admin to give you a role.';
       return;
     }
-    currentUser=makeUser(cred.user.email,role);
+    let perms=null;
+    try{
+      const acc=(await fbDb.ref('access/'+cred.user.uid).once('value')).val();
+      if(acc&&acc.perms) perms=acc.perms;
+      else if(role==='admin'){ try{ await fbDb.ref('access/'+cred.user.uid).set({email:cred.user.email,role:'admin',perms:{dashboard:true,load:true,daily:true,admin:true,recipes:true},updatedAt:Date.now()}); }catch(_){} }
+    }catch(_){ /* access rules not added yet: use role defaults */ }
+    currentUser=makeUser(cred.user.email,role,perms); currentUser.uid=cred.user.uid;
     await cloudStart();
   }catch(e){ msg.textContent=friendlyAuthError(e); try{await fbAuth.signOut()}catch(_){} currentUser=null; return; }
   finally{ if(btn)btn.disabled=false; }
   document.getElementById('password').value='';
   document.getElementById('login').style.display='none'; document.getElementById('app').style.display='block';
   applySidebarState(); applyPermissions(); restoreSectionContentStates(); refresh();
+  const uw=document.getElementById('userAccessWrap'); if(uw) uw.style.display=(currentUser.role==='admin')?'':'none';
+  if(currentUser.role==='admin'){ clearUserForm(); loadAccessList(); }
 }
 function clearLocalData(){[KEY_RECIPE,KEY_PROD,KEY_ALLOWED_LINE,KEY_COST,KEY_USERS,KEY_RMMASTER,KEY_PRODMETA,KEY_PRODACTIVE,KEY_TS].forEach(k=>localStorage.removeItem(k))}
 async function logout(){
@@ -422,36 +472,125 @@ function applyPermissions(){
  }
 }
 function saveLocal(){localStorage.setItem(KEY_RECIPE,JSON.stringify(recipes));localStorage.setItem(KEY_PROD,JSON.stringify(production));localStorage.setItem(KEY_ALLOWED_LINE,JSON.stringify(allowedLine));localStorage.setItem(KEY_COST,JSON.stringify(rmCost));localStorage.setItem(KEY_USERS,JSON.stringify(users));localStorage.setItem(KEY_RMMASTER,JSON.stringify(rmMaster));localStorage.setItem(KEY_PRODMETA,JSON.stringify(prodMeta));localStorage.setItem(KEY_PRODACTIVE,JSON.stringify(prodActive))}
-function addUser(){
- let email=norm(document.getElementById('userEmail').value).toLowerCase();
- let pass=norm(document.getElementById('userPass').value);
- if(!email||!pass)return alert('Please enter both an email and a password.');
- let perms={
-  dashboard:document.getElementById('permDashboard').checked,
-  load:document.getElementById('permLoad').checked,
-  daily:document.getElementById('permDaily').checked,
-  admin:document.getElementById('permAdmin').checked,
-  recipes:document.getElementById('permRecipes').checked
- };
- users=users.filter(x=>x.email.toLowerCase()!==email);
- users.push({email,password:pass,perms});
- save();
- document.getElementById('userEmail').value='';document.getElementById('userPass').value='';
- renderUsers();
- showMsg('userMsg',`Access saved for ${email}.`);
+let accessList=[], editingUid=null;
+const PAGE_LABELS={dashboard:'Dashboard',load:'Production Load',daily:'Daily Production',admin:'Admin Control',recipes:'Recipe Master'};
+const PERM_IDS={dashboard:'permDashboard',load:'permLoad',daily:'permDaily',admin:'permAdmin',recipes:'permRecipes'};
+const ROLE_LABELS={viewer:'Viewer',editor:'Editor',admin:'Admin'};
+function userMsg(text,kind){
+  const el=document.getElementById('userMsg'); if(!el)return;
+  el.classList.remove('hidden'); el.style.color=kind==='err'?'#b91c1c':(kind==='ok'?'#166534':'#374151'); el.textContent=text;
 }
-function deleteUser(email){if(!requireAdminPassword("remove user access"))return;
- if(!confirm(`Remove access for ${email}?`))return;
- users=users.filter(x=>x.email!==email);
- save();renderUsers();
+function onUserRoleChange(){
+  const isAdmin=document.getElementById('userRole').value==='admin';
+  PAGE_KEYS.forEach(k=>{const c=document.getElementById(PERM_IDS[k]); c.disabled=isAdmin; if(isAdmin)c.checked=true;});
+}
+function clearUserForm(keepMsg){
+  editingUid=null;
+  const e=document.getElementById('userEmail'); e.value=''; e.readOnly=false;
+  const p=document.getElementById('userPass'); p.value=''; p.disabled=false; p.placeholder='Set a password';
+  document.getElementById('userUid').value='';
+  document.getElementById('userRole').value='editor';
+  PAGE_KEYS.forEach(k=>{const c=document.getElementById(PERM_IDS[k]); c.disabled=false; c.checked=(k!=='admin');});
+  document.getElementById('userSaveBtn').textContent='Save User';
+  if(!keepMsg){const m=document.getElementById('userMsg'); if(m)m.classList.add('hidden');}
+}
+async function loadAccessList(){
+  if(!currentUser||currentUser.role!=='admin'||!fbDb)return;
+  try{
+    const v=(await fbDb.ref('access').once('value')).val()||{};
+    accessList=Object.entries(v).map(([uid,a])=>({uid,email:(a&&a.email)||'(no email)',role:(a&&a.role)||'viewer',perms:(a&&a.perms)||{}})).sort((x,y)=>x.email.localeCompare(y.email));
+    renderUsers();
+  }catch(e){
+    accessList=[]; renderUsers();
+    userMsg('Cannot load the user list ('+((e&&e.message)||e)+'). Add the one-time Firebase rules shown below the list.','err');
+  }
+}
+async function authUidFor(email,pw){
+  const app2=firebase.apps.find(a=>a.name==='pp-secondary')||firebase.initializeApp(FIREBASE_CONFIG,'pp-secondary');
+  const a2=app2.auth();
+  await a2.setPersistence(firebase.auth.Auth.Persistence.NONE);
+  let cred;
+  try{ cred=await a2.createUserWithEmailAndPassword(email,pw); }
+  catch(e){
+    if(e&&e.code==='auth/email-already-in-use'){ cred=await a2.signInWithEmailAndPassword(email,pw); }
+    else throw e;
+  }
+  const uid=cred.user.uid; await a2.signOut(); return uid;
+}
+function userErr(e){
+  const c=(e&&e.code)||'', m=String((e&&e.message)||e);
+  if(c==='auth/weak-password') return 'Password is too short (minimum 6 characters).';
+  if(c==='auth/invalid-email') return 'That email address is not valid.';
+  if(c==='auth/invalid-credential'||c==='auth/wrong-password') return 'This email already has a Firebase login, but that password does not match. Leave the password empty and paste its User UID under "Login already exists in Firebase".';
+  if(m.toLowerCase().includes('permission')) return 'Permission denied. Only an Admin can manage users.';
+  return m;
+}
+async function saveUserAccess(){
+  if(!currentUser||currentUser.role!=='admin') return alert('Only an Admin can manage users.');
+  const email=norm(document.getElementById('userEmail').value).toLowerCase();
+  const pass=document.getElementById('userPass').value.trim();
+  const role=document.getElementById('userRole').value;
+  const uidManual=norm(document.getElementById('userUid').value);
+  if(!email) return userMsg('Please enter the email.','err');
+  const perms={}; PAGE_KEYS.forEach(k=>perms[k]=(role==='admin')?true:document.getElementById(PERM_IDS[k]).checked);
+  const btn=document.getElementById('userSaveBtn'); btn.disabled=true; userMsg('Saving...');
+  try{
+    let uid=editingUid||uidManual||null;
+    if(!uid){
+      if(pass.length<6){ userMsg('Enter a password of at least 6 characters for a new login.','err'); return; }
+      uid=await authUidFor(email,pass);
+    }
+    if(uid===currentUser.uid&&role!=='admin'){ userMsg('You cannot remove your own Admin role.','err'); return; }
+    await fbDb.ref('staff/'+uid).set(role);
+    try{ await fbDb.ref('access/'+uid).set({email,role,perms,updatedAt:Date.now()}); }
+    catch(e){ userMsg('The role was saved, but the user list could not be updated ('+((e&&e.message)||e)+'). Add the one-time Firebase rules shown below the list.','err'); return; }
+    clearUserForm(true);
+    userMsg('Saved: '+email+' can log in as '+ROLE_LABELS[role]+'.','ok');
+    await loadAccessList();
+  }catch(e){ userMsg(userErr(e),'err'); }
+  finally{ btn.disabled=false; }
+}
+function editUser(i){
+  const u=accessList[i]; if(!u)return;
+  editingUid=u.uid;
+  const e=document.getElementById('userEmail'); e.value=u.email; e.readOnly=true;
+  const p=document.getElementById('userPass'); p.value=''; p.disabled=true; p.placeholder='Use "Reset password" in the list to change it';
+  document.getElementById('userUid').value='';
+  document.getElementById('userRole').value=u.role;
+  PAGE_KEYS.forEach(k=>{document.getElementById(PERM_IDS[k]).checked=!!u.perms[k];});
+  onUserRoleChange();
+  document.getElementById('userSaveBtn').textContent='Update User';
+  userMsg('Editing '+u.email+'. Change the role or pages, then click Update User.','info');
+  if(e.scrollIntoView)e.scrollIntoView({behavior:'smooth',block:'center'});
+}
+async function removeUserAccess(i){
+  const u=accessList[i]; if(!u)return;
+  if(u.uid===currentUser.uid) return alert('You cannot remove your own access.');
+  if(!confirm('Remove access for '+u.email+'? They will not be able to log in any more.')) return;
+  try{
+    await fbDb.ref('staff/'+u.uid).remove();
+    try{ await fbDb.ref('access/'+u.uid).remove(); }catch(e){}
+    userMsg('Access removed for '+u.email+'. (Their Firebase login still exists; delete it in Firebase Authentication if you want.)','ok');
+    await loadAccessList();
+  }catch(e){ userMsg(userErr(e),'err'); }
+}
+async function resetUserPassword(i){
+  const u=accessList[i]; if(!u)return;
+  try{ await fbAuth.sendPasswordResetEmail(u.email); userMsg('Password reset email sent to '+u.email+'.','ok'); }
+  catch(e){ userMsg(userErr(e),'err'); }
 }
 function renderUsers(){
- let b=document.getElementById('userBody'); if(!b)return; b.innerHTML='';
- users.forEach(u=>{
-  let tags=PAGE_KEYS.filter(k=>u.perms[k]).map(k=>({dashboard:'Dashboard',load:'Production Load',daily:'Daily Production',admin:'Admin Control',recipes:'Recipe Master'}[k]));
-  b.innerHTML+=`<tr><td><b>${esc(u.email)}</b></td><td>${tags.map(t=>`<span class="pill" style="margin:2px">${esc(t)}</span>`).join('')||'<span style="color:#94a3b8">No pages</span>'}</td><td class="num"><button class="btn red sm" onclick="deleteUser('${escAttr(u.email)}')">Remove</button></td></tr>`;
- });
- if(!b.innerHTML)b.innerHTML='<tr><td colspan="3" class="empty">No additional users yet. The Master Admin password always works.</td></tr>';
+  let b=document.getElementById('userBody'); if(!b)return;
+  const me=currentUser&&currentUser.uid;
+  b.innerHTML=accessList.map((u,i)=>{
+    const tags=(u.role==='admin')?['All pages']:PAGE_KEYS.filter(k=>u.perms[k]).map(k=>PAGE_LABELS[k]);
+    const isMe=u.uid===me;
+    return `<tr><td><b>${esc(u.email)}</b>${isMe?' <span style="color:#6b7280">(you)</span>':''}</td>`
+     +`<td><span class="pill">${esc(ROLE_LABELS[u.role]||u.role)}</span></td>`
+     +`<td>${tags.map(t=>`<span class="pill" style="margin:2px">${esc(t)}</span>`).join('')||'<span style="color:#94a3b8">No pages</span>'}</td>`
+     +`<td class="num"><button class="btn gray sm" onclick="editUser(${i})">Edit</button> <button class="btn gray sm" onclick="resetUserPassword(${i})">Reset password</button>`
+     +(isMe?'':` <button class="btn red sm" onclick="removeUserAccess(${i})">Remove</button>`)+`</td></tr>`;
+  }).join('')||'<tr><td colspan="4" class="empty">No users listed yet.</td></tr>';
 }
 function showPage(name,el){
   PAGE_KEYS.forEach(x=>document.getElementById(x+'Page').classList.add('hidden'));
