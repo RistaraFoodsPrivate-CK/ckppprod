@@ -304,6 +304,8 @@ th{background:#faf7ff;color:#6b5b83;font-size:9px}th,td{padding:7px;border-botto
 
 <script>
 const KEY_RECIPE='pp_recipe_master_v3', KEY_PROD='pp_daily_production_v2', KEY_ALLOWED_LINE='pp_allowed_lines_v1', KEY_COST='pp_rm_cost_v1', KEY_SIDEBAR='pp_sidebar_hidden_v1', KEY_USERS='pp_users_v1', KEY_RMMASTER='pp_rm_master_v1', KEY_PRODMETA='pp_prod_meta_v1', KEY_PRODACTIVE='pp_prod_active_v1';
+const KEY_TS='pp_cloud_ts_v1';
+let cloudReady=false, cloudTs=Number(localStorage.getItem(KEY_TS)||0), pushTimer=null, pushing=false, cloudInitPromise=null;
 let recipes=JSON.parse(localStorage.getItem(KEY_RECIPE)||'[]');
 let production=JSON.parse(localStorage.getItem(KEY_PROD)||'[]');
 let allowedLine=JSON.parse(localStorage.getItem(KEY_ALLOWED_LINE)||'{}');
@@ -370,15 +372,21 @@ function onManualProdChange(v){
   const el=document.getElementById('manUom');
   if(el)el.value=uom;
 }
-function login(){
+async function login(){
   let email=norm(document.getElementById('email').value).toLowerCase();
   let pass=document.getElementById('password').value;
+  const msg=document.getElementById('loginMsg'); msg.textContent='';
   if(!email && pass==='Admin123'){
    currentUser={email:'',master:true,perms:{dashboard:true,load:true,daily:true,admin:true,recipes:true}};
   } else {
+   if(cloudInitPromise){msg.style.color='#374151';msg.textContent='Connecting to server...';await cloudInitPromise;msg.textContent='';msg.style.color='#b91c1c';}
    let u=users.find(x=>x.email.toLowerCase()===email && x.password===pass);
-   if(!u){ document.getElementById('loginMsg').textContent='Incorrect email or password.'; return; }
-   currentUser={email:u.email,master:false,perms:u.perms};
+   if(u){ currentUser={email:u.email,master:false,perms:u.perms}; }
+   else {
+    let st=await legacyStaffLogin(email,pass);
+    if(!st){ msg.textContent='Incorrect email or password.'; return; }
+    currentUser=st;
+   }
   }
   document.getElementById('login').style.display='none'; document.getElementById('app').style.display='block';
   applySidebarState(); applyPermissions(); restoreSectionContentStates(); refresh();
@@ -401,7 +409,7 @@ function applyPermissions(){
   showPage(firstKey, document.querySelector(`.nav[data-page="${firstKey}"]`));
  }
 }
-function save(){localStorage.setItem(KEY_RECIPE,JSON.stringify(recipes));localStorage.setItem(KEY_PROD,JSON.stringify(production));localStorage.setItem(KEY_ALLOWED_LINE,JSON.stringify(allowedLine));localStorage.setItem(KEY_COST,JSON.stringify(rmCost));localStorage.setItem(KEY_USERS,JSON.stringify(users));localStorage.setItem(KEY_RMMASTER,JSON.stringify(rmMaster));localStorage.setItem(KEY_PRODMETA,JSON.stringify(prodMeta));localStorage.setItem(KEY_PRODACTIVE,JSON.stringify(prodActive))}
+function saveLocal(){localStorage.setItem(KEY_RECIPE,JSON.stringify(recipes));localStorage.setItem(KEY_PROD,JSON.stringify(production));localStorage.setItem(KEY_ALLOWED_LINE,JSON.stringify(allowedLine));localStorage.setItem(KEY_COST,JSON.stringify(rmCost));localStorage.setItem(KEY_USERS,JSON.stringify(users));localStorage.setItem(KEY_RMMASTER,JSON.stringify(rmMaster));localStorage.setItem(KEY_PRODMETA,JSON.stringify(prodMeta));localStorage.setItem(KEY_PRODACTIVE,JSON.stringify(prodActive))}
 function addUser(){
  let email=norm(document.getElementById('userEmail').value).toLowerCase();
  let pass=norm(document.getElementById('userPass').value);
@@ -1102,8 +1110,116 @@ function esc(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&l
 function escAttr(v){return String(v??'').replace(/'/g,"\\'")}
 function clearProduction(){if(!requireAdminPassword("clear all production"))return;if(confirm('Clear ALL daily production across every date?')){production=[];touchData();save();refresh()}}
 function clearRecipes(){if(!requireAdminPassword("delete Recipe Master"))return;if(confirm('Delete the recipe master? You will need to upload it again.')){recipes=[];production=[];allowedLine={};rmCost={};prodActive={};rebuildIndexes();save();refresh()}}
+/* ================= Firebase Realtime Database sync (REST) =================
+   All shared data is stored under one node: /pp_control_center
+   Your existing /app and /staff nodes are NOT modified (staff is only read for login). */
+const FB_URL='https://ckppprod-default-rtdb.firebaseio.com';
+const FB_NODE='pp_control_center';
+function save(){saveLocal();cloudSchedule()}
+function cloudBadge(text,kind){
+  let el=document.getElementById('cloudBadge');
+  if(!el){el=document.createElement('div');el.id='cloudBadge';el.style.cssText='position:fixed;right:12px;bottom:10px;font-size:11px;font-weight:700;padding:5px 11px;border-radius:999px;z-index:99999;box-shadow:0 2px 8px rgba(0,0,0,.15)';document.body.appendChild(el);}
+  const c={ok:['#dcfce7','#166534'],warn:['#fef3c7','#92400e'],err:['#fee2e2','#991b1b'],info:['#e5e7eb','#374151']}[kind||'info'];
+  el.style.background=c[0];el.style.color=c[1];el.textContent=text;
+}
+function cloudSnapshot(){return {recipes,production,allowedLine,rmCost,users,rmMaster,prodMeta,prodActive}}
+function applyCloud(d){
+  recipes=Array.isArray(d.recipes)?d.recipes:[];
+  production=Array.isArray(d.production)?d.production:[];
+  users=Array.isArray(d.users)?d.users:[];
+  allowedLine=d.allowedLine&&typeof d.allowedLine==='object'?d.allowedLine:{};
+  rmCost=d.rmCost&&typeof d.rmCost==='object'?d.rmCost:{};
+  rmMaster=d.rmMaster&&typeof d.rmMaster==='object'?d.rmMaster:{};
+  prodMeta=d.prodMeta&&typeof d.prodMeta==='object'?d.prodMeta:{};
+  prodActive=d.prodActive&&typeof d.prodActive==='object'?d.prodActive:{};
+  rebuildIndexes(); touchData(); saveLocal();
+}
+async function cloudGet(path){
+  const r=await fetch(`${FB_URL}/${path}.json`,{cache:'no-store'});
+  if(!r.ok) throw new Error(r.status===401?'Permission denied (check Database Rules)':'HTTP '+r.status);
+  return await r.json();
+}
+function hasLocalData(){return recipes.length||production.length||users.length||Object.keys(rmMaster).length}
+async function cloudInit(){
+  try{
+    cloudBadge('Connecting to server...','info');
+    const node=await cloudGet(FB_NODE);
+    if(node&&node.data){
+      applyCloud(JSON.parse(node.data));
+      cloudTs=node.updatedAt||0; localStorage.setItem(KEY_TS,String(cloudTs));
+      cloudReady=true; cloudBadge('Synced with server','ok');
+    } else {
+      cloudReady=true;
+      if(hasLocalData()){await cloudPushNow(true);} else cloudBadge('Server connected (no data yet)','ok');
+    }
+  }catch(e){
+    cloudReady=false; cloudBadge('Server offline: '+e.message+' - changes are NOT shared','err');
+  }
+  cloudInitPromise=null;
+}
+function cloudSchedule(){
+  if(!cloudReady){cloudBadge('Server offline - change saved on this device only','err');return}
+  clearTimeout(pushTimer); pushTimer=setTimeout(()=>cloudPushNow(false),800);
+}
+async function cloudPushNow(force){
+  if(pushing){clearTimeout(pushTimer);pushTimer=setTimeout(()=>cloudPushNow(force),800);return}
+  pushing=true; pushTimer=null;
+  try{
+    if(!force){
+      const remoteTs=await cloudGet(FB_NODE+'/updatedAt');
+      if(remoteTs&&remoteTs>cloudTs){
+        const node=await cloudGet(FB_NODE);
+        applyCloud(JSON.parse(node.data)); cloudTs=node.updatedAt; localStorage.setItem(KEY_TS,String(cloudTs));
+        cloudBadge('Updated from server','warn');
+        if(currentUser) refresh();
+        alert('Another user changed the data a moment ago. The latest data has been loaded, so your last change was NOT saved. Please repeat it.');
+        pushing=false; return;
+      }
+    }
+    const ts=Date.now();
+    const r=await fetch(`${FB_URL}/${FB_NODE}.json`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({data:JSON.stringify(cloudSnapshot()),updatedAt:ts})});
+    if(!r.ok) throw new Error(r.status===401?'Permission denied (check Database Rules)':'HTTP '+r.status);
+    cloudTs=ts; localStorage.setItem(KEY_TS,String(ts)); cloudBadge('Saved to server','ok');
+  }catch(e){ cloudBadge('Save failed: '+e.message,'err'); }
+  pushing=false;
+}
+async function cloudPoll(){
+  if(pushing||pushTimer) return;
+  if(!cloudReady){ if(!cloudInitPromise){cloudInitPromise=cloudInit();} return; }
+  try{
+    const remoteTs=await cloudGet(FB_NODE+'/updatedAt');
+    if(remoteTs&&remoteTs>cloudTs){
+      const node=await cloudGet(FB_NODE);
+      applyCloud(JSON.parse(node.data)); cloudTs=node.updatedAt; localStorage.setItem(KEY_TS,String(cloudTs));
+      cloudBadge('Updated from server','ok');
+      if(currentUser) refresh();
+    }
+  }catch(e){ cloudBadge('Server offline: '+e.message,'err'); }
+}
+/* Old users stored in Firebase /staff can still log in (read-only, best-effort field matching) */
+async function legacyStaffLogin(email,pass){
+  if(!email||!pass) return null;
+  try{
+    const staff=await cloudGet('staff'); if(!staff||typeof staff!=='object') return null;
+    const list=Array.isArray(staff)?staff:Object.entries(staff).map(([k,v])=>(v&&typeof v==='object')?Object.assign({_key:k},v):{_key:k,_val:v});
+    for(const u of list){
+      if(!u) continue;
+      const ids=[u.email,u.username,u.user,u.userId,u.id,u.name,u._key].filter(x=>x!=null).map(x=>String(x).toLowerCase().trim());
+      const pw=[u.password,u.pass,u.pwd,u.pin,u._val].filter(x=>x!=null).map(String);
+      if(ids.includes(email)&&pw.includes(pass)){
+        let perms=(u.perms&&typeof u.perms==='object')?u.perms:null;
+        const role=String(u.role||u.type||'').toLowerCase();
+        if(!perms){perms=(role==='admin')?{dashboard:true,load:true,daily:true,admin:true,recipes:true}:{dashboard:true,load:true,daily:true,admin:false,recipes:true};}
+        return {email,master:false,perms:Object.assign({dashboard:false,load:false,daily:false,admin:false,recipes:false},perms)};
+      }
+    }
+  }catch(e){}
+  return null;
+}
+cloudInitPromise=cloudInit();
+setInterval(cloudPoll,30000);
+
 clearBom();
 </script>
-<script>document.addEventListener("DOMContentLoaded",restoreAdminSection);</script>
 </body>
 </html>
